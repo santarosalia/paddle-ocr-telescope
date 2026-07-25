@@ -5,3 +5,10 @@ Pillow>=10.0.0
 paddlepaddle>=3.0.0
 requests>=2.31.0
 tqdm>=4.66.0
+# slim Text Telescope exporter (scripts/export_telescope.py)
+shapely>=2.0.0
+pyyaml>=6.0
+pyclipper>=1.3.0
+scikit-image>=0.22.0
+lmdb>=1.4.0
+cython>=3.0.0

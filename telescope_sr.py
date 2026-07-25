@@ -100,14 +100,19 @@ class TelescopeSR:
         else:
             config.disable_gpu()
             config.set_cpu_math_library_num_threads(self.cpu_threads)
-            # MKLDNN can break some older SR graphs on macOS/arm
-            try:
-                config.disable_mkldnn()
-            except Exception:
-                pass
+            # MKLDNN / oneDNN can break some SR graphs on macOS/arm
+            for disable in ("disable_mkldnn", "disable_onednn"):
+                fn = getattr(config, disable, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
 
         config.switch_ir_optim(True)
-        config.enable_memory_optim()
+        # Paddle 3.x + macOS: enable_memory_optim(True) raises
+        # "Not find predictor_id ... memory_optimize_pass"
+        config.enable_memory_optim(False)
         config.disable_glog_info()
         config.switch_use_feed_fetch_ops(False)
 
@@ -120,19 +125,21 @@ class TelescopeSR:
         ]
         logger.info("Loaded Telescope model from %s", self.model_dir)
 
-    def _preprocess(self, img: Image.Image) -> np.ndarray:
+    def _preprocess(self, img: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+        """Return (NCHW batch float32, LR RGB uint8 for display)."""
         _, img_h, img_w = self.image_shape
         # Match PaddleOCR predict_sr: downsample by 2 (config down_sample_scale=2)
         lr = img.resize((img_w // 2, img_h // 2), Image.BICUBIC)
-        arr = np.array(lr).astype("float32").transpose(2, 0, 1) / 255.0
-        return arr[np.newaxis, ...]
+        lr_rgb = np.array(lr).astype(np.uint8)
+        arr = lr_rgb.astype("float32").transpose(2, 0, 1) / 255.0
+        return arr[np.newaxis, ...], lr_rgb
 
     def predict(self, image: ImageInput) -> TelescopeResult:
         import time
 
         pil = _to_pil_rgb(image)
         original = np.array(pil)
-        batch = self._preprocess(pil)
+        batch, lr_img = self._preprocess(pil)
 
         t0 = time.perf_counter()
         self._input_handle.copy_from_cpu(batch)
@@ -140,16 +147,13 @@ class TelescopeSR:
         outputs = [h.copy_to_cpu() for h in self._output_handles]
         elapsed = time.perf_counter() - t0
 
-        # Official predict_sr: outputs[0]=lr, outputs[1]=sr
-        if len(outputs) >= 2:
-            lr_batch, sr_batch = outputs[0], outputs[1]
-        else:
-            # fallback: only SR returned
-            sr_batch = outputs[0]
-            lr_batch = batch
-
-        lr_img = _tensor_to_rgb(lr_batch[0])
-        sr_img = _tensor_to_rgb(sr_batch[0])
+        # Exported graph returns SR only (lr aliases input and breaks PIR naming)
+        sr_batch = outputs[0]
+        # tanh head -> roughly [-1,1]; map to displayable RGB like common SR viz
+        sr_chw = sr_batch[0]
+        if float(sr_chw.min()) < -0.05:
+            sr_chw = (sr_chw + 1.0) * 0.5
+        sr_img = _tensor_to_rgb(sr_chw)
         return TelescopeResult(
             original=original, lr=lr_img, sr=sr_img, elapsed_sec=elapsed
         )

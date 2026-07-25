@@ -98,33 +98,65 @@ def extract_weights(archive: Path) -> Path:
     return params.with_suffix("")
 
 
-def export_inference(paddleocr_dir: Path, pretrained: Path, out_dir: Path) -> None:
+def ensure_export_deps() -> None:
+    """Minimal deps for our slim exporter (no imgaug / visualdl)."""
+    pkgs = [
+        "shapely>=2.0.0",
+        "pyyaml>=6.0",
+        "pyclipper>=1.3.0",
+        "scikit-image>=0.22.0",
+        "lmdb>=1.4.0",
+        "cython>=3.0.0",
+    ]
+    print("[deps] ensuring export dependencies…")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-q", *pkgs]
+    )
+
+
+def export_inference(
+    paddleocr_dir: Path,
+    pretrained: Path,
+    out_dir: Path,
+    force: bool = False,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     marker = out_dir / "inference.pdiparams"
     alt = out_dir / "model.pdiparams"
-    if marker.exists() or alt.exists():
-        print(f"[skip] inference model already exists: {out_dir}")
+    if not force and (marker.exists() or alt.exists()):
+        print(f"[skip] inference model already exists: {out_dir} (use --force to re-export)")
         return
 
     cfg = paddleocr_dir / "configs" / "sr" / "sr_telescope.yml"
     if not cfg.exists():
         raise FileNotFoundError(f"Missing config: {cfg}")
 
+    ensure_export_deps()
+
+    for p in out_dir.glob("inference.*"):
+        p.unlink()
+    for p in out_dir.glob("model.*"):
+        p.unlink()
+
+    export_script = ROOT / "scripts" / "export_telescope.py"
     cmd = [
         sys.executable,
-        "tools/export_model.py",
-        "-c",
+        str(export_script),
+        "--paddleocr-dir",
+        str(paddleocr_dir),
+        "--config",
         str(cfg),
         "-o",
         f"Global.pretrained_model={pretrained}",
+        "-o",
         f"Global.save_inference_dir={out_dir}",
+        "-o",
         "Global.use_gpu=False",
     ]
     print("[export]", " ".join(cmd))
-    subprocess.check_call(cmd, cwd=str(paddleocr_dir))
+    subprocess.check_call(cmd)
 
     if not marker.exists() and not alt.exists():
-        # export may write nested files
         nested = list(out_dir.rglob("*.pdiparams"))
         if not nested:
             raise RuntimeError(f"Export finished but no pdiparams under {out_dir}")
@@ -139,6 +171,11 @@ def main() -> None:
         "--skip-clone",
         action="store_true",
         help="Assume vendor/PaddleOCR already exists",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-export inference model even if it already exists",
     )
     parser.add_argument(
         "--weights-url",
@@ -156,7 +193,7 @@ def main() -> None:
 
     archive = download(args.weights_url, WEIGHTS_DIR / "sr_telescope_train.tar")
     pretrained = extract_weights(archive)
-    export_inference(paddleocr_dir, pretrained, MODELS)
+    export_inference(paddleocr_dir, pretrained, MODELS, force=args.force)
     print("\nDone. Run Streamlit with:\n  streamlit run app.py")
 
 
