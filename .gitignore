@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+.env
+.DS_Store
+*.egg-info/
+dist/
+build/
+
+# model & vendor
+models/
+vendor/
+third_party/
+*.tar
+*.tar.gz
+*.pdparams
+*.pdiparams
+*.pdmodel
+*.json
+
+# runtime
+infer_result/
+inference_results/
+.streamlit/secrets.toml
+uploads/
+tmp/
