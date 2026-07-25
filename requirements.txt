@@ -3,6 +3,7 @@ numpy>=1.24.0
 opencv-python-headless>=4.8.0
 Pillow>=10.0.0
 paddlepaddle>=3.0.0
+paddleocr>=3.0.0
 requests>=2.31.0
 tqdm>=4.66.0
 # slim Text Telescope exporter (scripts/export_telescope.py)
