@@ -5,7 +5,7 @@ Usage:
   python scripts/eval_sr_ocr.py --image receipt.jpg
   python scripts/eval_sr_ocr.py --image-dir ./samples --lang korean
   python scripts/eval_sr_ocr.py --image receipt.jpg --skip-sr      # LR + DE-GAN
-  python scripts/eval_sr_ocr.py --image receipt.jpg --skip-degan # LR + Telescope
+  python scripts/eval_sr_ocr.py --image receipt.jpg --skip-degan   # LR + Telescope
   python scripts/eval_sr_ocr.py --image receipt.jpg --skip-sr --skip-degan  # LR only
 """
 
@@ -62,18 +62,18 @@ class ImageEvalResult:
     path: str
     lr_size: tuple[int, int]
     lr: Optional[OcrEval] = None
-    telescope: Optional[OcrEval] = None
+    sr: Optional[OcrEval] = None  # Text Telescope SR OCR (kept for app.py compat)
     degan: Optional[OcrEval] = None
-    telescope_size: Optional[tuple[int, int]] = None
-    telescope_elapsed_sec: Optional[float] = None
+    sr_size: Optional[tuple[int, int]] = None
+    sr_elapsed_sec: Optional[float] = None
     degan_elapsed_sec: Optional[float] = None
     degan_task: Optional[str] = None
-    delta_mean_telescope: Optional[float] = None
-    delta_median_telescope: Optional[float] = None
+    delta_mean: Optional[float] = None  # SR vs LR (app.py compat)
+    delta_median: Optional[float] = None
     delta_mean_degan: Optional[float] = None
     delta_median_degan: Optional[float] = None
     best_by_mean: Optional[str] = None
-    telescope_image: Optional[np.ndarray] = None
+    sr_image: Optional[np.ndarray] = None
     degan_image: Optional[np.ndarray] = None
     error: Optional[str] = None
 
@@ -193,44 +193,47 @@ def _pick_best_by_mean(lr: OcrEval, variants: dict[str, OcrEval]) -> Optional[st
     return max(candidates, key=candidates.get)
 
 
-def evaluate_image(
-    image_path: Path,
+def evaluate_pil(
+    pil: Image.Image,
     ocr: Any,
     telescope: Optional[Any],
-    degan: Optional[Any],
+    degan: Optional[Any] = None,
     *,
-    overlap: int,
-    batch_size: int,
-    max_side: Optional[int],
-    low_threshold: float,
-    degan_task: str,
+    path: str = "<image>",
+    overlap: int = 8,
+    batch_size: int = 8,
+    max_side: Optional[int] = None,
+    low_threshold: float = 0.8,
+    skip_sr: bool = False,
+    degan_task: str = "deblur",
 ) -> ImageEvalResult:
-    pil = Image.open(image_path).convert("RGB")
+    """Run LR (+ optional Telescope SR / DE-GAN) OCR confidence eval on an in-memory image."""
+    pil = pil.convert("RGB")
     lr_size = pil.size
 
     try:
         lr_lines = run_ocr(pil, ocr)
         lr_eval = evaluate_ocr(lr_lines, low_threshold)
 
-        telescope_eval = None
+        sr_eval = None
         degan_eval = None
-        telescope_size = None
-        telescope_elapsed = None
+        sr_size = None
+        sr_elapsed = None
         degan_elapsed = None
-        telescope_image = None
+        sr_image = None
         degan_image = None
 
-        if telescope is not None:
+        if not skip_sr and telescope is not None:
             sr_result = telescope.predict_full(
                 pil,
                 overlap=overlap,
                 batch_size=batch_size,
                 max_side=max_side,
             )
-            telescope_image = sr_result.sr
-            telescope_size = (sr_result.sr.shape[1], sr_result.sr.shape[0])
-            telescope_elapsed = sr_result.elapsed_sec
-            telescope_eval = evaluate_ocr(run_ocr(Image.fromarray(sr_result.sr), ocr), low_threshold)
+            sr_image = sr_result.sr
+            sr_size = (sr_result.sr.shape[1], sr_result.sr.shape[0])
+            sr_elapsed = sr_result.elapsed_sec
+            sr_eval = evaluate_ocr(run_ocr(Image.fromarray(sr_result.sr), ocr), low_threshold)
 
         if degan is not None:
             degan_result = degan.predict(pil)
@@ -238,39 +241,68 @@ def evaluate_image(
             degan_elapsed = degan_result.elapsed_sec
             degan_eval = evaluate_ocr(run_ocr(Image.fromarray(degan_result.enhanced), ocr), low_threshold)
 
-        d_mean_t, d_median_t = (None, None)
-        d_mean_d, d_median_d = (None, None)
-        if telescope_eval is not None:
-            d_mean_t, d_median_t = _delta(lr_eval, telescope_eval)
+        delta_mean, delta_median = (None, None)
+        delta_mean_d, delta_median_d = (None, None)
+        if sr_eval is not None:
+            delta_mean, delta_median = _delta(lr_eval, sr_eval)
         if degan_eval is not None:
-            d_mean_d, d_median_d = _delta(lr_eval, degan_eval)
+            delta_mean_d, delta_median_d = _delta(lr_eval, degan_eval)
 
-        variants = {}
-        if telescope_eval is not None:
-            variants["telescope"] = telescope_eval
+        variants: dict[str, OcrEval] = {}
+        if sr_eval is not None:
+            variants["sr"] = sr_eval
         if degan_eval is not None:
             variants["degan"] = degan_eval
 
         return ImageEvalResult(
-            path=str(image_path),
+            path=path,
             lr_size=lr_size,
             lr=lr_eval,
-            telescope=telescope_eval,
+            sr=sr_eval,
             degan=degan_eval,
-            telescope_size=telescope_size,
-            telescope_elapsed_sec=telescope_elapsed,
+            sr_size=sr_size,
+            sr_elapsed_sec=sr_elapsed,
             degan_elapsed_sec=degan_elapsed,
             degan_task=degan_task if degan is not None else None,
-            delta_mean_telescope=d_mean_t,
-            delta_median_telescope=d_median_t,
-            delta_mean_degan=d_mean_d,
-            delta_median_degan=d_median_d,
+            delta_mean=delta_mean,
+            delta_median=delta_median,
+            delta_mean_degan=delta_mean_d,
+            delta_median_degan=delta_median_d,
             best_by_mean=_pick_best_by_mean(lr_eval, variants),
-            telescope_image=telescope_image,
+            sr_image=sr_image,
             degan_image=degan_image,
         )
-    except Exception as exc:  # noqa: BLE001
-        return ImageEvalResult(path=str(image_path), lr_size=lr_size, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — collect per-image errors in batch runs
+        return ImageEvalResult(path=path, lr_size=lr_size, error=str(exc))
+
+
+def evaluate_image(
+    image_path: Path,
+    ocr: Any,
+    telescope: Optional[Any],
+    degan: Optional[Any] = None,
+    *,
+    overlap: int,
+    batch_size: int,
+    max_side: Optional[int],
+    low_threshold: float,
+    skip_sr: bool = False,
+    degan_task: str = "deblur",
+) -> ImageEvalResult:
+    pil = Image.open(image_path).convert("RGB")
+    return evaluate_pil(
+        pil,
+        ocr,
+        telescope,
+        degan,
+        path=str(image_path),
+        overlap=overlap,
+        batch_size=batch_size,
+        max_side=max_side,
+        low_threshold=low_threshold,
+        skip_sr=skip_sr,
+        degan_task=degan_task,
+    )
 
 
 def _collect_variant_scores(results: list[ImageEvalResult], attr: str) -> list[float]:
@@ -286,7 +318,7 @@ def _collect_variant_scores(results: list[ImageEvalResult], attr: str) -> list[f
 
 def _aggregate(results: list[ImageEvalResult], low_threshold: float) -> dict[str, Any]:
     lr_scores = _collect_variant_scores(results, "lr")
-    telescope_scores = _collect_variant_scores(results, "telescope")
+    sr_scores = _collect_variant_scores(results, "sr")
     degan_scores = _collect_variant_scores(results, "degan")
 
     agg: dict[str, Any] = {
@@ -297,23 +329,23 @@ def _aggregate(results: list[ImageEvalResult], low_threshold: float) -> dict[str
     }
     if lr_scores:
         agg["lr"] = asdict(summarize_scores(np.array(lr_scores), low_threshold))
-    if telescope_scores:
-        agg["telescope"] = asdict(summarize_scores(np.array(telescope_scores), low_threshold))
+    if sr_scores:
+        agg["sr"] = asdict(summarize_scores(np.array(sr_scores), low_threshold))
     if degan_scores:
         agg["degan"] = asdict(summarize_scores(np.array(degan_scores), low_threshold))
 
     lr_arr = np.array(lr_scores) if lr_scores else None
     if lr_arr is not None and lr_arr.size:
-        if telescope_scores:
-            tel_arr = np.array(telescope_scores)
-            agg["delta_mean_telescope"] = float(tel_arr.mean() - lr_arr.mean())
-            agg["delta_median_telescope"] = float(np.median(tel_arr) - np.median(lr_arr))
+        if sr_scores:
+            sr_arr = np.array(sr_scores)
+            agg["delta_mean"] = float(sr_arr.mean() - lr_arr.mean())
+            agg["delta_median"] = float(np.median(sr_arr) - np.median(lr_arr))
         if degan_scores:
             deg_arr = np.array(degan_scores)
             agg["delta_mean_degan"] = float(deg_arr.mean() - lr_arr.mean())
             agg["delta_median_degan"] = float(np.median(deg_arr) - np.median(lr_arr))
 
-    wins = {"lr": 0, "telescope": 0, "degan": 0}
+    wins = {"lr": 0, "sr": 0, "degan": 0}
     for item in results:
         if item.best_by_mean in wins:
             wins[item.best_by_mean] += 1
@@ -346,10 +378,10 @@ def _print_image_report(item: ImageEvalResult, low_threshold: float) -> None:
         return
 
     print(f"  LR size: {item.lr_size[0]}×{item.lr_size[1]}")
-    if item.telescope_size:
+    if item.sr_size:
         print(
-            f"  Telescope size: {item.telescope_size[0]}×{item.telescope_size[1]} "
-            f"({item.telescope_elapsed_sec * 1000:.0f} ms)"
+            f"  SR (Telescope) size: {item.sr_size[0]}×{item.sr_size[1]} "
+            f"({item.sr_elapsed_sec * 1000:.0f} ms)"
         )
     if item.degan_elapsed_sec is not None:
         print(
@@ -359,26 +391,28 @@ def _print_image_report(item: ImageEvalResult, low_threshold: float) -> None:
 
     if item.lr:
         _print_eval("LR OCR", item.lr, low_threshold)
-    if item.telescope:
-        _print_eval("Telescope OCR", item.telescope, low_threshold)
+    if item.sr:
+        _print_eval("SR (Telescope) OCR", item.sr, low_threshold)
     if item.degan:
         _print_eval("DE-GAN OCR", item.degan, low_threshold)
 
-    for label, d_mean, d_median in (
-        ("Telescope", item.delta_mean_telescope, item.delta_median_telescope),
-        ("DE-GAN", item.delta_mean_degan, item.delta_median_degan),
-    ):
-        if d_mean is not None:
-            sign = "+" if d_mean >= 0 else ""
-            print(f"  Δ {label} mean={sign}{d_mean:.4f}, Δ median={sign}{d_median:.4f}")
+    if item.delta_mean is not None:
+        sign = "+" if item.delta_mean >= 0 else ""
+        print(f"  Δ SR mean={sign}{item.delta_mean:.4f}, Δ median={sign}{item.delta_median:.4f}")
+    if item.delta_mean_degan is not None:
+        sign = "+" if item.delta_mean_degan >= 0 else ""
+        print(
+            f"  Δ DE-GAN mean={sign}{item.delta_mean_degan:.4f}, "
+            f"Δ median={sign}{item.delta_median_degan:.4f}"
+        )
 
     if item.best_by_mean:
         print(f"  best_by_mean: {item.best_by_mean}")
 
     if item.lr:
         _print_lines("LR", item.lr)
-    if item.telescope:
-        _print_lines("Telescope", item.telescope)
+    if item.sr:
+        _print_lines("SR (Telescope)", item.sr)
     if item.degan:
         _print_lines("DE-GAN", item.degan)
 
@@ -386,7 +420,7 @@ def _print_image_report(item: ImageEvalResult, low_threshold: float) -> None:
 def _dataclass_to_json(obj: Any) -> Any:
     if hasattr(obj, "__dataclass_fields__"):
         data = asdict(obj)
-        data.pop("telescope_image", None)
+        data.pop("sr_image", None)
         data.pop("degan_image", None)
         return {k: _dataclass_to_json(v) for k, v in data.items()}
     if isinstance(obj, list):
@@ -420,17 +454,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-sr", action="store_true", help="Skip Text Telescope SR")
     parser.add_argument("--skip-degan", action="store_true", help="Skip DE-GAN enhancement")
     parser.add_argument("--output", type=Path, help="Write JSON report")
-    parser.add_argument("--save-telescope-dir", type=Path, help="Save Telescope SR PNGs")
+    parser.add_argument(
+        "--save-sr-dir",
+        type=Path,
+        help="Save Telescope SR images as <stem>_sr.png under this directory",
+    )
     parser.add_argument("--save-degan-dir", type=Path, help="Save DE-GAN enhanced PNGs")
-    # backward compat
-    parser.add_argument("--save-sr-dir", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     images = _collect_images(args.image or args.image_dir)
-    save_telescope_dir = args.save_telescope_dir or args.save_sr_dir
 
     if args.skip_sr:
         telescope = None
@@ -472,16 +507,17 @@ def main() -> None:
             batch_size=args.batch_size,
             max_side=args.max_side,
             low_threshold=args.low_threshold,
+            skip_sr=args.skip_sr,
             degan_task=degan_task,
         )
         results.append(item)
         _print_image_report(item, args.low_threshold)
 
-        if save_telescope_dir and item.telescope_image is not None and not item.error:
-            save_telescope_dir.mkdir(parents=True, exist_ok=True)
-            out = save_telescope_dir / f"{image_path.stem}_telescope.png"
-            Image.fromarray(item.telescope_image).save(out)
-            print(f"  saved Telescope -> {out}")
+        if args.save_sr_dir and item.sr_image is not None and not item.error:
+            args.save_sr_dir.mkdir(parents=True, exist_ok=True)
+            out = args.save_sr_dir / f"{image_path.stem}_sr.png"
+            Image.fromarray(item.sr_image).save(out)
+            print(f"  saved SR -> {out}")
 
         if args.save_degan_dir and item.degan_image is not None and not item.error:
             args.save_degan_dir.mkdir(parents=True, exist_ok=True)
