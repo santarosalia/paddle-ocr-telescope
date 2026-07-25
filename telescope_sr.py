@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -24,6 +25,7 @@ class TelescopeResult:
     lr: np.ndarray
     sr: np.ndarray
     elapsed_sec: float
+    tile_count: int = 1
 
 
 def _to_pil_rgb(image: ImageInput) -> Image.Image:
@@ -45,7 +47,9 @@ def _to_pil_rgb(image: ImageInput) -> Image.Image:
 
 
 def _tensor_to_rgb(chw: np.ndarray) -> np.ndarray:
-    """(C,H,W) float [0,1] -> (H,W,3) uint8 RGB."""
+    """(C,H,W) float -> (H,W,3) uint8 RGB. Handles tanh [-1,1] or [0,1]."""
+    if float(chw.min()) < -0.05:
+        chw = (chw + 1.0) * 0.5
     img = np.clip(chw * 255.0, 0, 255).transpose(1, 2, 0).astype(np.uint8)
     return img
 
@@ -66,11 +70,30 @@ def _find_model_files(model_dir: Path) -> tuple[Path, Path]:
     )
 
 
+def _pad_to_cover(
+    img: np.ndarray, tile_h: int, tile_w: int, stride_h: int, stride_w: int
+) -> tuple[np.ndarray, int, int]:
+    """Pad so sliding window with stride covers the full image."""
+    h, w = img.shape[:2]
+    out_h = h if h <= tile_h else tile_h + ((h - tile_h + stride_h - 1) // stride_h) * stride_h
+    out_w = w if w <= tile_w else tile_w + ((w - tile_w + stride_w - 1) // stride_w) * stride_w
+    out_h = max(out_h, tile_h)
+    out_w = max(out_w, tile_w)
+    if out_h == h and out_w == w:
+        return img, h, w
+    padded = np.pad(
+        img,
+        ((0, out_h - h), (0, out_w - w), (0, 0)),
+        mode="edge",
+    )
+    return padded, h, w
+
+
 class TelescopeSR:
     """Text Telescope super-resolution (Paddle Inference).
 
-    Designed for word/line crops. Default shape is 3x32x128
-    (input is bicubic-downsampled to 16x64, then SR to 32x128).
+    Fixed patch: LR 16×64 → SR 32×128 (×2).
+    ``predict_full`` tiles a whole LR image (e.g. receipt) and stitches ×2 SR.
     """
 
     def __init__(
@@ -88,6 +111,16 @@ class TelescopeSR:
         self._input_handle = None
         self._output_handles = None
         self._load()
+
+    @property
+    def lr_tile_hw(self) -> tuple[int, int]:
+        _, img_h, img_w = self.image_shape
+        return img_h // 2, img_w // 2
+
+    @property
+    def sr_tile_hw(self) -> tuple[int, int]:
+        _, img_h, img_w = self.image_shape
+        return img_h, img_w
 
     def _load(self) -> None:
         from paddle import inference
@@ -125,41 +158,132 @@ class TelescopeSR:
         ]
         logger.info("Loaded Telescope model from %s", self.model_dir)
 
-    def _preprocess(self, img: Image.Image) -> tuple[np.ndarray, np.ndarray]:
-        """Return (NCHW batch float32, LR RGB uint8 for display)."""
-        _, img_h, img_w = self.image_shape
-        # Match PaddleOCR predict_sr: downsample by 2 (config down_sample_scale=2)
-        lr = img.resize((img_w // 2, img_h // 2), Image.BICUBIC)
-        lr_rgb = np.array(lr).astype(np.uint8)
-        arr = lr_rgb.astype("float32").transpose(2, 0, 1) / 255.0
-        return arr[np.newaxis, ...], lr_rgb
+    def _patch_to_nchw(self, patch_rgb: np.ndarray) -> np.ndarray:
+        tile_h, tile_w = self.lr_tile_hw
+        if patch_rgb.shape[0] != tile_h or patch_rgb.shape[1] != tile_w:
+            patch_rgb = np.array(
+                Image.fromarray(patch_rgb).resize((tile_w, tile_h), Image.BICUBIC)
+            )
+        return patch_rgb.astype("float32").transpose(2, 0, 1) / 255.0
+
+    def _run_batch(self, batch_nchw: np.ndarray) -> list[np.ndarray]:
+        """NCHW float32 -> list of HWC uint8 SR tiles."""
+        self._input_handle.copy_from_cpu(batch_nchw)
+        self._predictor.run()
+        sr_batch = self._output_handles[0].copy_to_cpu()
+        return [_tensor_to_rgb(sr_batch[i]) for i in range(sr_batch.shape[0])]
 
     def predict(self, image: ImageInput) -> TelescopeResult:
-        import time
-
+        """Single patch: resize upload to LR tile, return one SR tile (demo/crop)."""
         pil = _to_pil_rgb(image)
         original = np.array(pil)
-        batch, lr_img = self._preprocess(pil)
+        tile_h, tile_w = self.lr_tile_hw
+        lr_img = np.array(pil.resize((tile_w, tile_h), Image.BICUBIC), dtype=np.uint8)
 
         t0 = time.perf_counter()
-        self._input_handle.copy_from_cpu(batch)
-        self._predictor.run()
-        outputs = [h.copy_to_cpu() for h in self._output_handles]
+        batch = self._patch_to_nchw(lr_img)[np.newaxis, ...]
+        sr_img = self._run_batch(batch)[0]
         elapsed = time.perf_counter() - t0
 
-        # Exported graph returns SR only (lr aliases input and breaks PIR naming)
-        sr_batch = outputs[0]
-        # tanh head -> roughly [-1,1]; map to displayable RGB like common SR viz
-        sr_chw = sr_batch[0]
-        if float(sr_chw.min()) < -0.05:
-            sr_chw = (sr_chw + 1.0) * 0.5
-        sr_img = _tensor_to_rgb(sr_chw)
         return TelescopeResult(
-            original=original, lr=lr_img, sr=sr_img, elapsed_sec=elapsed
+            original=original, lr=lr_img, sr=sr_img, elapsed_sec=elapsed, tile_count=1
+        )
+
+    def predict_full(
+        self,
+        image: ImageInput,
+        overlap: int = 8,
+        batch_size: int = 8,
+        max_side: Optional[int] = None,
+    ) -> TelescopeResult:
+        """Treat upload as LR; tile whole image and stitch ×2 SR (receipts, etc.)."""
+        pil = _to_pil_rgb(image)
+        if max_side is not None:
+            w, h = pil.size
+            long_side = max(w, h)
+            if long_side > max_side:
+                scale = max_side / long_side
+                pil = pil.resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    Image.BICUBIC,
+                )
+
+        lr = np.array(pil, dtype=np.uint8)
+        original = lr.copy()
+        tile_h, tile_w = self.lr_tile_hw
+        sr_h, sr_w = self.sr_tile_hw
+        scale = sr_h // tile_h  # 2
+
+        overlap = int(np.clip(overlap, 0, min(tile_h, tile_w) - 1))
+        stride_h = max(1, tile_h - overlap)
+        stride_w = max(1, tile_w - overlap)
+
+        padded, orig_h, orig_w = _pad_to_cover(lr, tile_h, tile_w, stride_h, stride_w)
+        ph, pw = padded.shape[:2]
+
+        ys = list(range(0, ph - tile_h + 1, stride_h))
+        xs = list(range(0, pw - tile_w + 1, stride_w))
+        if not ys:
+            ys = [0]
+        if not xs:
+            xs = [0]
+        # ensure bottom-right coverage
+        if ys[-1] != ph - tile_h:
+            ys.append(ph - tile_h)
+        if xs[-1] != pw - tile_w:
+            xs.append(pw - tile_w)
+
+        coords = [(y, x) for y in ys for x in xs]
+        out_h, out_w = ph * scale, pw * scale
+        acc = np.zeros((out_h, out_w, 3), dtype=np.float64)
+        weight = np.zeros((out_h, out_w, 1), dtype=np.float64)
+
+        # raised-cosine-ish weights to hide seams
+        wy = np.hanning(tile_h * scale) if tile_h * scale > 1 else np.ones(1)
+        wx = np.hanning(tile_w * scale) if tile_w * scale > 1 else np.ones(1)
+        if float(wy.sum()) == 0:
+            wy = np.ones_like(wy)
+        if float(wx.sum()) == 0:
+            wx = np.ones_like(wx)
+        tile_weight = np.outer(wy, wx).astype(np.float64)[..., np.newaxis]
+        tile_weight = np.maximum(tile_weight, 1e-3)
+
+        t0 = time.perf_counter()
+        for start in range(0, len(coords), batch_size):
+            chunk = coords[start : start + batch_size]
+            patches = []
+            for y, x in chunk:
+                patches.append(self._patch_to_nchw(padded[y : y + tile_h, x : x + tile_w]))
+            batch = np.stack(patches, axis=0)
+            sr_tiles = self._run_batch(batch)
+            for (y, x), sr_tile in zip(chunk, sr_tiles):
+                oy, ox = y * scale, x * scale
+                acc[oy : oy + sr_h, ox : ox + sr_w] += sr_tile.astype(np.float64) * tile_weight
+                weight[oy : oy + sr_h, ox : ox + sr_w] += tile_weight
+
+        sr_full = (acc / np.maximum(weight, 1e-6)).clip(0, 255).astype(np.uint8)
+        sr_full = sr_full[: orig_h * scale, : orig_w * scale]
+        elapsed = time.perf_counter() - t0
+
+        logger.info(
+            "Full-image SR: %dx%d → %dx%d (%d tiles, %.1f ms)",
+            orig_w,
+            orig_h,
+            sr_full.shape[1],
+            sr_full.shape[0],
+            len(coords),
+            elapsed * 1000,
+        )
+        return TelescopeResult(
+            original=original,
+            lr=lr,
+            sr=sr_full,
+            elapsed_sec=elapsed,
+            tile_count=len(coords),
         )
 
     def predict_batch(self, images: list[ImageInput]) -> list[TelescopeResult]:
-        return [self.predict(img) for img in images]
+        return [self.predict_full(img) for img in images]
 
 
 _cached: Optional[TelescopeSR] = None

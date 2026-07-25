@@ -1,4 +1,4 @@
-"""Streamlit demo: Text Telescope before / after comparison."""
+"""Streamlit demo: Text Telescope full-image (receipt) SR."""
 
 from __future__ import annotations
 
@@ -21,43 +21,40 @@ def _model_ready(model_dir: Path) -> bool:
     return any(model_dir.rglob("*.pdiparams"))
 
 
-def _upscale_for_display(img: np.ndarray, min_h: int = 96) -> np.ndarray:
-    """Nearest-neighbor upscale tiny SR crops so Streamlit shows them clearly."""
-    h, w = img.shape[:2]
-    if h >= min_h:
-        return img
-    scale = max(1, int(np.ceil(min_h / h)))
-    return np.array(
-        Image.fromarray(img).resize((w * scale, h * scale), Image.NEAREST)
-    )
-
-
 st.set_page_config(
     page_title="PaddleOCR Text Telescope",
     page_icon="🔭",
     layout="wide",
 )
 
-st.title("Text Telescope 전후 비교")
+st.title("Text Telescope — 영수증 전체 SR")
 st.caption(
-    "Scene Text Telescope (CVPR 2021) — 저해상도 텍스트 크롭을 초해상도(SR)로 복원합니다. "
-    "단어/행 단위 크롭 이미지에 최적화되어 있습니다."
+    "업로드 이미지를 저해상도(LR)로 보고, 타일 단위로 Text Telescope(×2)를 적용한 뒤 "
+    "전체를 이어 붙입니다."
 )
 
 with st.sidebar:
     st.header("설정")
-    model_dir = Path(
-        st.text_input("모델 경로", value=str(DEFAULT_MODEL))
-    )
+    model_dir = Path(st.text_input("모델 경로", value=str(DEFAULT_MODEL)))
     use_gpu = st.checkbox("GPU 사용", value=False)
-    show_lr = st.checkbox("모델 입력(LR)도 표시", value=True)
-    enlarge = st.checkbox("작은 결과 확대 표시", value=True)
+    overlap = st.slider("타일 오버랩 (px)", min_value=0, max_value=12, value=8)
+    batch_size = st.slider("배치 크기", min_value=1, max_value=16, value=8)
+    limit_side = st.checkbox("긴 변 제한 (속도)", value=True)
+    max_side = st.number_input(
+        "긴 변 최대 px",
+        min_value=256,
+        max_value=4096,
+        value=1280,
+        step=64,
+        disabled=not limit_side,
+    )
     st.divider()
     st.markdown(
         "**모델 준비**\n\n"
         "```bash\npip install -r requirements.txt\n"
         "python scripts/setup_model.py\n```"
     )
+    st.caption("타일 LR 16×64 → SR 32×128. 영수증처럼 텍스트가 많은 이미지에 적합합니다.")
 
 if not _model_ready(model_dir):
     st.warning(
@@ -67,85 +64,80 @@ if not _model_ready(model_dir):
     st.stop()
 
 uploaded = st.file_uploader(
-    "이미지 업로드 (텍스트 크롭 / 단어 영역 권장)",
+    "영수증 / 저해상도 이미지 업로드",
     type=["png", "jpg", "jpeg", "bmp", "webp"],
 )
 
 if uploaded is None:
-    st.info("이미지를 업로드하면 Telescope 적용 전·후를 나란히 보여줍니다.")
+    st.info("이미지를 업로드하면 전체 ×2 Telescope SR 전후를 비교합니다.")
     st.stop()
 
 pil = Image.open(uploaded).convert("RGB")
 
 col_meta1, col_meta2 = st.columns(2)
 with col_meta1:
-    st.write(f"원본 크기: **{pil.size[0]} × {pil.size[1]}**")
+    st.write(f"원본(LR) 크기: **{pil.size[0]} × {pil.size[1]}**")
 with col_meta2:
     st.write(f"파일: `{uploaded.name}`")
 
-run = st.button("Telescope 실행", type="primary", use_container_width=True)
+run = st.button("전체 이미지 Telescope 실행", type="primary", use_container_width=True)
 
 if not run:
-    st.subheader("업로드 원본")
+    st.subheader("업로드 원본 (LR)")
     st.image(pil, use_container_width=True)
     st.stop()
 
-with st.spinner("Text Telescope 추론 중…"):
+with st.spinner("전체 이미지 타일 SR 추론 중… (크기에 따라 시간이 걸릴 수 있습니다)"):
     try:
         engine: TelescopeSR = get_telescope(model_dir, use_gpu=use_gpu)
-        result = engine.predict(pil)
+        result = engine.predict_full(
+            pil,
+            overlap=int(overlap),
+            batch_size=int(batch_size),
+            max_side=int(max_side) if limit_side else None,
+        )
     except Exception as exc:  # noqa: BLE001 — show in UI
         st.error(f"추론 실패: {exc}")
         st.exception(exc)
         st.stop()
 
-st.success(f"완료 ({result.elapsed_sec * 1000:.1f} ms)")
+st.success(
+    f"완료 — {result.tile_count}타일, {result.elapsed_sec * 1000:.0f} ms · "
+    f"{result.lr.shape[1]}×{result.lr.shape[0]} → "
+    f"{result.sr.shape[1]}×{result.sr.shape[0]}"
+)
 
-disp_orig = _upscale_for_display(result.original) if enlarge else result.original
-disp_lr = _upscale_for_display(result.lr) if enlarge else result.lr
-disp_sr = _upscale_for_display(result.sr) if enlarge else result.sr
-
-if show_lr:
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.subheader("원본")
-        st.image(disp_orig, use_container_width=True)
-        st.caption(f"{result.original.shape[1]}×{result.original.shape[0]}")
-    with c2:
-        st.subheader("Before (LR)")
-        st.image(disp_lr, use_container_width=True)
-        st.caption(
-            f"{result.lr.shape[1]}×{result.lr.shape[0]} — 모델 입력 (bicubic ↓2)"
-        )
-    with c3:
-        st.subheader("After (SR)")
-        st.image(disp_sr, use_container_width=True)
-        st.caption(f"{result.sr.shape[1]}×{result.sr.shape[0]} — Telescope 출력")
-else:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Before (원본)")
-        st.image(disp_orig, use_container_width=True)
-        st.caption(f"{result.original.shape[1]}×{result.original.shape[0]}")
-    with c2:
-        st.subheader("After (Telescope SR)")
-        st.image(disp_sr, use_container_width=True)
-        st.caption(f"{result.sr.shape[1]}×{result.sr.shape[0]}")
+c1, c2 = st.columns(2)
+with c1:
+    st.subheader("Before (LR)")
+    st.image(result.lr, use_container_width=True)
+    st.caption(f"{result.lr.shape[1]}×{result.lr.shape[0]}")
+with c2:
+    st.subheader("After (SR ×2)")
+    st.image(result.sr, use_container_width=True)
+    st.caption(f"{result.sr.shape[1]}×{result.sr.shape[0]}")
 
 st.divider()
 st.subheader("Before / After 나란히")
-# side-by-side strip for quick visual diff (LR upscaled to SR size)
 lr_matched = np.array(
     Image.fromarray(result.lr).resize(
         (result.sr.shape[1], result.sr.shape[0]), Image.NEAREST
     )
 )
+# 너무 큰 비교 스트립은 표시용으로만 축소
 strip = np.concatenate([lr_matched, result.sr], axis=1)
-if enlarge:
-    strip = _upscale_for_display(strip, min_h=128)
+max_strip_w = 2400
+if strip.shape[1] > max_strip_w:
+    scale = max_strip_w / strip.shape[1]
+    strip = np.array(
+        Image.fromarray(strip).resize(
+            (max_strip_w, max(1, int(strip.shape[0] * scale))),
+            Image.BILINEAR,
+        )
+    )
 st.image(
     strip,
-    caption="Left: LR (before)  |  Right: SR (after)",
+    caption="Left: LR (nearest ×2)  |  Right: Telescope SR",
     use_container_width=True,
 )
 
