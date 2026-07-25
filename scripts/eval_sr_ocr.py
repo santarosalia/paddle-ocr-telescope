@@ -163,18 +163,20 @@ def evaluate_ocr(lines: list[RecLine], low_threshold: float) -> OcrEval:
     return OcrEval(lines=lines, summary=summarize_scores(scores, low_threshold))
 
 
-def evaluate_image(
-    image_path: Path,
+def evaluate_pil(
+    pil: Image.Image,
     ocr: Any,
     telescope: Optional[Any],
     *,
+    path: str = "<image>",
     overlap: int,
     batch_size: int,
     max_side: Optional[int],
     low_threshold: float,
     skip_sr: bool,
 ) -> ImageEvalResult:
-    pil = Image.open(image_path).convert("RGB")
+    """Run LR (and optional SR) OCR confidence eval on an in-memory RGB image."""
+    pil = pil.convert("RGB")
     lr_size = pil.size
 
     try:
@@ -182,7 +184,7 @@ def evaluate_image(
         lr_eval = evaluate_ocr(lr_lines, low_threshold)
 
         if skip_sr or telescope is None:
-            return ImageEvalResult(path=str(image_path), lr_size=lr_size, lr=lr_eval)
+            return ImageEvalResult(path=path, lr_size=lr_size, lr=lr_eval)
 
         sr_result = telescope.predict_full(
             pil,
@@ -201,7 +203,7 @@ def evaluate_image(
             delta_median = sr_eval.summary.median - lr_eval.summary.median
 
         return ImageEvalResult(
-            path=str(image_path),
+            path=path,
             lr_size=lr_size,
             sr_size=(sr_result.sr.shape[1], sr_result.sr.shape[0]),
             lr=lr_eval,
@@ -212,8 +214,32 @@ def evaluate_image(
             sr_image=sr_result.sr,
         )
     except Exception as exc:  # noqa: BLE001 — collect per-image errors in batch runs
-        return ImageEvalResult(path=str(image_path), lr_size=lr_size, error=str(exc))
+        return ImageEvalResult(path=path, lr_size=lr_size, error=str(exc))
 
+
+def evaluate_image(
+    image_path: Path,
+    ocr: Any,
+    telescope: Optional[Any],
+    *,
+    overlap: int,
+    batch_size: int,
+    max_side: Optional[int],
+    low_threshold: float,
+    skip_sr: bool,
+) -> ImageEvalResult:
+    pil = Image.open(image_path).convert("RGB")
+    return evaluate_pil(
+        pil,
+        ocr,
+        telescope,
+        path=str(image_path),
+        overlap=overlap,
+        batch_size=batch_size,
+        max_side=max_side,
+        low_threshold=low_threshold,
+        skip_sr=skip_sr,
+    )
 
 def _aggregate(results: list[ImageEvalResult], low_threshold: float) -> dict[str, Any]:
     lr_scores = []
