@@ -11,6 +11,7 @@ import streamlit as st
 from PIL import Image
 
 from telescope_sr import TelescopeSR, get_telescope
+from degan_enhance import DeGANTask, degan_ready, get_degan
 from text_sr_pipeline import (
     create_text_detector,
     create_text_recognizer,
@@ -28,6 +29,7 @@ from eval_sr_ocr import (  # noqa: E402
 )
 
 DEFAULT_MODEL = ROOT / "models" / "sr_telescope"
+DEFAULT_DEGAN_ROOT = ROOT / "vendor" / "DE-GAN"
 
 
 def _model_ready(model_dir: Path) -> bool:
@@ -53,6 +55,11 @@ def _cached_detector(unclip_ratio: float, box_thresh: float, det_model: str):
 @st.cache_resource(show_spinner="TextRecognition 로딩 중…")
 def _cached_recognizer(lang: str, rec_model: str):
     return create_text_recognizer(lang=lang, model_name=rec_model or None)
+
+
+@st.cache_resource(show_spinner="DE-GAN 로딩 중…")
+def _cached_degan(degan_root: str, task: str):
+    return get_degan(Path(degan_root), task=task)  # type: ignore[arg-type]
 
 
 def _summary_metrics(summary, low_threshold: float) -> None:
@@ -145,6 +152,7 @@ def _render_eval_tab(
     pil: Image.Image,
     name: str,
     model_dir: Path,
+    degan_root: Path,
     use_gpu: bool,
     overlap: int,
     batch_size: int,
@@ -153,9 +161,11 @@ def _render_eval_tab(
     low_threshold: float,
     rec_score_thresh: float,
     skip_sr: bool,
+    skip_degan: bool,
+    degan_task: DeGANTask,
 ) -> None:
     run = st.button(
-        "LR vs SR OCR 평가 실행",
+        "LR / SR / DE-GAN OCR 평가 실행",
         type="primary",
         use_container_width=True,
         key="run_eval",
@@ -163,27 +173,39 @@ def _render_eval_tab(
     if not run:
         st.subheader("업로드 원본 (LR)")
         st.image(pil, use_container_width=True)
-        st.caption("전체 이미지에 OCR을 돌려 LR/SR 신뢰도를 비교합니다.")
+        st.caption(
+            "전체 이미지에 OCR을 돌려 LR · Text Telescope SR · DE-GAN 전처리 후 "
+            "rec confidence를 비교합니다."
+        )
         return
 
     if not skip_sr and not _model_ready(model_dir):
         st.error(f"Telescope 모델이 없습니다: `{model_dir}`")
+        return
+    if not skip_degan and not degan_ready(degan_root, degan_task):
+        st.error(
+            f"DE-GAN 가중치가 없습니다: `{degan_root}/weights`\n\n"
+            "터미널에서 `python scripts/setup_degan.py` 를 실행하세요."
+        )
         return
 
     with st.spinner("OCR 평가 중…"):
         try:
             ocr = _cached_ocr(lang, float(rec_score_thresh))
             telescope = None if skip_sr else get_telescope(model_dir, use_gpu=use_gpu)
+            degan = None if skip_degan else _cached_degan(str(degan_root), degan_task)
             item = evaluate_pil(
                 pil,
                 ocr,
                 telescope,
+                degan,
                 path=name,
                 overlap=overlap,
                 batch_size=batch_size,
                 max_side=max_side,
                 low_threshold=float(low_threshold),
                 skip_sr=skip_sr,
+                degan_task=degan_task,
             )
         except Exception as exc:  # noqa: BLE001
             st.error(f"평가 실패: {exc}")
@@ -194,13 +216,82 @@ def _render_eval_tab(
         st.error(item.error)
         return
 
+    if item.best_by_mean:
+        labels = {"lr": "LR", "sr": "Telescope SR", "degan": f"DE-GAN ({degan_task})"}
+        st.success(f"best_by_mean: **{labels.get(item.best_by_mean, item.best_by_mean)}**")
+
+    deltas = []
     if item.delta_mean is not None:
         sign = "+" if item.delta_mean >= 0 else ""
-        st.success(
-            f"Δ mean {sign}{item.delta_mean:.4f} · Δ median {sign}{item.delta_median:.4f}"
+        deltas.append(f"SR Δ mean {sign}{item.delta_mean:.4f}")
+    if item.delta_mean_degan is not None:
+        sign = "+" if item.delta_mean_degan >= 0 else ""
+        deltas.append(f"DE-GAN Δ mean {sign}{item.delta_mean_degan:.4f}")
+    if deltas:
+        st.caption(" · ".join(deltas))
+
+    compare_rows = []
+    if item.lr:
+        compare_rows.append(
+            {
+                "variant": "LR",
+                "lines": item.lr.summary.count,
+                "mean": round(item.lr.summary.mean, 4),
+                "median": round(item.lr.summary.median, 4),
+                "low_ratio": f"{item.lr.summary.low_ratio:.0%}",
+            }
         )
-    else:
-        st.success("평가 완료")
+    if item.sr:
+        compare_rows.append(
+            {
+                "variant": "Telescope SR",
+                "lines": item.sr.summary.count,
+                "mean": round(item.sr.summary.mean, 4),
+                "median": round(item.sr.summary.median, 4),
+                "low_ratio": f"{item.sr.summary.low_ratio:.0%}",
+            }
+        )
+    if item.degan:
+        compare_rows.append(
+            {
+                "variant": f"DE-GAN ({item.degan_task})",
+                "lines": item.degan.summary.count,
+                "mean": round(item.degan.summary.mean, 4),
+                "median": round(item.degan.summary.median, 4),
+                "low_ratio": f"{item.degan.summary.low_ratio:.0%}",
+            }
+        )
+    if compare_rows:
+        st.subheader("신뢰도 요약")
+        st.dataframe(compare_rows, use_container_width=True, hide_index=True)
+
+    if item.sr_image is not None or item.degan_image is not None:
+        st.subheader("전처리 결과 미리보기")
+        cols = st.columns(2)
+        col_idx = 0
+        if item.sr_image is not None:
+            with cols[col_idx]:
+                st.caption(
+                    f"Telescope SR · {item.sr_size[0]}×{item.sr_size[1]}"
+                    + (
+                        f" · {item.sr_elapsed_sec * 1000:.0f} ms"
+                        if item.sr_elapsed_sec is not None
+                        else ""
+                    )
+                )
+                st.image(item.sr_image, use_container_width=True)
+            col_idx += 1
+        if item.degan_image is not None:
+            with cols[min(col_idx, 1)]:
+                st.caption(
+                    f"DE-GAN ({item.degan_task})"
+                    + (
+                        f" · {item.degan_elapsed_sec * 1000:.0f} ms"
+                        if item.degan_elapsed_sec is not None
+                        else ""
+                    )
+                )
+                st.image(item.degan_image, use_container_width=True)
 
     if item.lr:
         st.subheader("LR OCR")
@@ -208,10 +299,15 @@ def _render_eval_tab(
         with st.expander("LR 라인", expanded=False):
             _lines_table(item.lr.lines)
     if item.sr:
-        st.subheader("SR OCR")
+        st.subheader("Telescope SR OCR")
         _summary_metrics(item.sr.summary, low_threshold)
         with st.expander("SR 라인", expanded=False):
             _lines_table(item.sr.lines)
+    if item.degan:
+        st.subheader(f"DE-GAN OCR ({item.degan_task})")
+        _summary_metrics(item.degan.summary, low_threshold)
+        with st.expander("DE-GAN 라인", expanded=False):
+            _lines_table(item.degan.lines)
 
 
 def _render_box_tab(
@@ -328,7 +424,7 @@ st.set_page_config(
 
 st.title("Text Telescope")
 st.caption(
-    "전체 SR · 전체 OCR 비교 · 박스별 det→크롭→SR→인식"
+    "전체 SR · LR/SR/DE-GAN OCR 비교 · 박스별 det→크롭→SR→인식"
 )
 
 with st.sidebar:
@@ -360,11 +456,20 @@ with st.sidebar:
     st.header("전체 OCR 평가")
     low_threshold = st.slider("low-confidence 기준", 0.0, 1.0, 0.8, 0.05)
     rec_score_thresh = st.number_input("rec score thresh", 0.0, 1.0, 0.0, 0.05)
+    skip_degan = st.checkbox("DE-GAN 건너뛰기", value=False)
+    degan_root = Path(st.text_input("DE-GAN 경로", value=str(DEFAULT_DEGAN_ROOT)))
+    degan_task: DeGANTask = st.selectbox(  # type: ignore[assignment]
+        "DE-GAN task",
+        options=["deblur", "binarize", "unwatermark"],
+        index=0,
+        help="영수증 blur/fade → deblur, 대비/이진화 → binarize",
+    )
 
     st.divider()
     st.markdown(
         "```bash\npip install -r requirements.txt\n"
-        "python scripts/setup_model.py\n```"
+        "python scripts/setup_model.py\n"
+        "python scripts/setup_degan.py\n```"
     )
 
 max_side_arg = int(max_side) if limit_side else None
@@ -423,6 +528,7 @@ with tab_eval:
         pil,
         uploaded.name,
         model_dir,
+        degan_root,
         use_gpu,
         int(overlap),
         int(batch_size),
@@ -431,4 +537,6 @@ with tab_eval:
         float(low_threshold),
         float(rec_score_thresh),
         skip_sr,
+        skip_degan,
+        degan_task,
     )
