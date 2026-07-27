@@ -1,4 +1,4 @@
-"""Detect → crop → Text Telescope SR → recognize (per text box)."""
+"""Full-image classic preprocess → detect → crop → recognize (per text box)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 ImageInput = Union[str, np.ndarray, Image.Image]
 
-# lang → PaddleOCR TextRecognition model_name
 REC_MODEL_BY_LANG = {
     "korean": "korean_PP-OCRv5_mobile_rec",
     "en": "en_PP-OCRv5_mobile_rec",
@@ -31,22 +30,25 @@ class BoxResult:
     index: int
     poly: list[list[float]]
     lr_crop: np.ndarray
-    sr_crop: Optional[np.ndarray] = None
+    pp_crop: Optional[np.ndarray] = None
     lr_text: str = ""
     lr_score: float = 0.0
-    sr_text: Optional[str] = None
-    sr_score: Optional[float] = None
-    sr_elapsed_sec: Optional[float] = None
+    pp_text: Optional[str] = None
+    pp_score: Optional[float] = None
     error: Optional[str] = None
 
 
 @dataclass
-class DetSrRecResult:
+class DetPpRecResult:
     image: np.ndarray
     annotated: np.ndarray
     boxes: list[BoxResult] = field(default_factory=list)
     elapsed_sec: float = 0.0
     det_count: int = 0
+    pp_image: Optional[np.ndarray] = None
+    pp_elapsed_sec: Optional[float] = None
+    pp_method: Optional[str] = None
+    pp_scale: float = 1.0
 
 
 def _to_rgb_array(image: ImageInput) -> np.ndarray:
@@ -137,7 +139,6 @@ def recognize_patch(recognizer: Any, crop_rgb: np.ndarray) -> tuple[str, float]:
 
 
 def crop_quad(image_rgb: np.ndarray, points: np.ndarray, pad_ratio: float = 0.05) -> np.ndarray:
-    """Perspective-crop a 4-point text box (PaddleOCR-style), with optional expand."""
     pts = np.asarray(points, dtype=np.float32).reshape(4, 2).copy()
     if pad_ratio > 0:
         center = pts.mean(axis=0)
@@ -179,9 +180,8 @@ def annotate_boxes(
     image_rgb: np.ndarray,
     boxes: list[BoxResult],
     *,
-    use_sr_label: bool = True,
+    prefer_pp: bool = True,
 ) -> np.ndarray:
-    """Draw numbered boxes + short recognized text on a copy of the image."""
     canvas = image_rgb.copy()
     pil = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil)
@@ -192,37 +192,56 @@ def annotate_boxes(
 
     for box in boxes:
         poly = [(float(x), float(y)) for x, y in box.poly]
-        color = (0, 180, 80) if (box.sr_text is not None and not box.error) else (220, 60, 60)
+        has_pp = box.pp_text is not None and not box.error
+        color = (0, 180, 80) if has_pp or not box.error else (220, 60, 60)
         draw.line(poly + [poly[0]], fill=color, width=2)
-        label_text = box.sr_text if use_sr_label and box.sr_text is not None else box.lr_text
-        label = f"#{box.index} {label_text[:18]}"
+        label_text = box.pp_text if prefer_pp and box.pp_text is not None else box.lr_text
+        label = f"#{box.index} {(label_text or '')[:18]}"
         x, y = poly[0]
         draw.rectangle([x, max(0, y - 14), x + 8 * len(label), y], fill=color)
         draw.text((x + 2, max(0, y - 13)), label, fill=(255, 255, 255), font=font)
     return np.array(pil)
 
 
-def run_det_sr_rec(
+def run_det_pp_rec(
     image: ImageInput,
     detector: Any,
     recognizer: Any,
-    telescope: Optional[Any],
+    enhancer: Optional[Any] = None,
     *,
     pad_ratio: float = 0.05,
-    skip_sr: bool = False,
+    skip_pp: bool = False,
     max_boxes: Optional[int] = None,
-) -> DetSrRecResult:
-    """Full per-box pipeline: detect → crop → (optional SR) → recognize."""
+) -> DetPpRecResult:
+    """Pipeline: (optional full-image classic preprocess) → detect → crop → recognize.
+
+    Detection runs on the preprocessed image when available. Same polygons are
+    cropped from LR and preprocessed images for score comparison.
+    """
     rgb = _to_rgb_array(image)
     t0 = time.perf_counter()
-    polys = detect_polys(detector, rgb)
+
+    pp_image: Optional[np.ndarray] = None
+    pp_elapsed: Optional[float] = None
+    pp_method: Optional[str] = None
+    pp_scale = 1.0
+    if not skip_pp and enhancer is not None:
+        out = enhancer.predict(Image.fromarray(rgb))
+        pp_image = out.enhanced
+        pp_elapsed = out.elapsed_sec
+        pp_method = out.method
+        pp_scale = float(getattr(out, "scale", 1.0) or 1.0)
+
+    det_image = pp_image if pp_image is not None else rgb
+    polys = detect_polys(detector, det_image)
     if max_boxes is not None:
         polys = polys[: max(0, int(max_boxes))]
 
     boxes: list[BoxResult] = []
     for idx, poly in enumerate(polys, start=1):
         try:
-            lr_crop = crop_quad(rgb, poly, pad_ratio=pad_ratio)
+            lr_poly = poly / pp_scale if pp_scale != 1.0 else poly
+            lr_crop = crop_quad(rgb, lr_poly, pad_ratio=pad_ratio)
             lr_text, lr_score = recognize_patch(recognizer, lr_crop)
             item = BoxResult(
                 index=idx,
@@ -231,15 +250,14 @@ def run_det_sr_rec(
                 lr_text=lr_text,
                 lr_score=lr_score,
             )
-            if not skip_sr and telescope is not None:
-                sr_out = telescope.predict(Image.fromarray(lr_crop))
-                item.sr_crop = sr_out.sr
-                item.sr_elapsed_sec = sr_out.elapsed_sec
-                sr_text, sr_score = recognize_patch(recognizer, sr_out.sr)
-                item.sr_text = sr_text
-                item.sr_score = sr_score
+            if pp_image is not None:
+                pp_crop = crop_quad(pp_image, poly, pad_ratio=pad_ratio)
+                pp_text, pp_score = recognize_patch(recognizer, pp_crop)
+                item.pp_crop = pp_crop
+                item.pp_text = pp_text
+                item.pp_score = pp_score
             boxes.append(item)
-        except Exception as exc:  # noqa: BLE001 — keep going on other boxes
+        except Exception as exc:  # noqa: BLE001
             logger.exception("box %s failed", idx)
             boxes.append(
                 BoxResult(
@@ -251,11 +269,21 @@ def run_det_sr_rec(
             )
 
     elapsed = time.perf_counter() - t0
-    annotated = annotate_boxes(rgb, boxes, use_sr_label=not skip_sr)
-    return DetSrRecResult(
+    annotated = annotate_boxes(det_image, boxes, prefer_pp=pp_image is not None)
+    return DetPpRecResult(
         image=rgb,
         annotated=annotated,
         boxes=boxes,
         elapsed_sec=elapsed,
         det_count=len(polys),
+        pp_image=pp_image,
+        pp_elapsed_sec=pp_elapsed,
+        pp_method=pp_method,
+        pp_scale=pp_scale,
     )
+
+
+# Compatibility aliases
+DetDeganRecResult = DetPpRecResult
+run_det_degan_rec = run_det_pp_rec
+run_det_rec = run_det_pp_rec

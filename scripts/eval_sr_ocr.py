@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Compare PaddleOCR rec confidence: LR vs Text Telescope SR vs DE-GAN.
+"""Compare PaddleOCR rec confidence: LR vs classic preprocess.
 
 Usage:
   python scripts/eval_sr_ocr.py --image receipt.jpg
-  python scripts/eval_sr_ocr.py --image-dir ./samples --lang korean
-  python scripts/eval_sr_ocr.py --image receipt.jpg --skip-sr      # LR + DE-GAN
-  python scripts/eval_sr_ocr.py --image receipt.jpg --skip-degan   # LR + Telescope
-  python scripts/eval_sr_ocr.py --image receipt.jpg --skip-sr --skip-degan  # LR only
+  python scripts/eval_sr_ocr.py --image-dir ./samples --method clahe
+  python scripts/eval_sr_ocr.py --image receipt.jpg --skip-pp  # LR only
 """
 
 from __future__ import annotations
@@ -26,11 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from degan_enhance import DeGANTask, degan_ready, get_degan
-from telescope_sr import get_telescope
+from classic_enhance import CLASSIC_METHODS, ClassicMethod, get_classic
 
-DEFAULT_MODEL = ROOT / "models" / "sr_telescope"
-DEFAULT_DEGAN_ROOT = ROOT / "vendor" / "DE-GAN"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
@@ -62,24 +57,14 @@ class ImageEvalResult:
     path: str
     lr_size: tuple[int, int]
     lr: Optional[OcrEval] = None
-    sr: Optional[OcrEval] = None  # Text Telescope SR OCR (kept for app.py compat)
-    degan: Optional[OcrEval] = None
-    sr_size: Optional[tuple[int, int]] = None
-    sr_elapsed_sec: Optional[float] = None
-    degan_elapsed_sec: Optional[float] = None
-    degan_task: Optional[str] = None
-    delta_mean: Optional[float] = None  # SR vs LR (app.py compat)
-    delta_median: Optional[float] = None
-    delta_mean_degan: Optional[float] = None
-    delta_median_degan: Optional[float] = None
+    pp: Optional[OcrEval] = None
+    pp_elapsed_sec: Optional[float] = None
+    pp_method: Optional[str] = None
+    delta_mean_pp: Optional[float] = None
+    delta_median_pp: Optional[float] = None
     best_by_mean: Optional[str] = None
-    sr_image: Optional[np.ndarray] = None
-    degan_image: Optional[np.ndarray] = None
+    pp_image: Optional[np.ndarray] = None
     error: Optional[str] = None
-
-
-def _model_ready(model_dir: Path) -> bool:
-    return model_dir.is_dir() and any(model_dir.rglob("*.pdiparams"))
 
 
 def _collect_images(path: Path) -> list[Path]:
@@ -117,7 +102,6 @@ def summarize_scores(scores: np.ndarray, low_threshold: float) -> ScoreSummary:
 
 
 def extract_rec_lines(ocr_page: Any) -> list[RecLine]:
-    """Normalize PaddleOCR 2.x / 3.x outputs to rec lines."""
     payload: Any = ocr_page
     if hasattr(payload, "json"):
         payload = payload.json
@@ -196,112 +180,71 @@ def _pick_best_by_mean(lr: OcrEval, variants: dict[str, OcrEval]) -> Optional[st
 def evaluate_pil(
     pil: Image.Image,
     ocr: Any,
-    telescope: Optional[Any],
-    degan: Optional[Any] = None,
+    enhancer: Optional[Any] = None,
     *,
     path: str = "<image>",
-    overlap: int = 8,
-    batch_size: int = 8,
-    max_side: Optional[int] = None,
     low_threshold: float = 0.8,
-    skip_sr: bool = False,
-    degan_task: str = "deblur",
+    pp_method: str = "receipt",
 ) -> ImageEvalResult:
-    """Run LR (+ optional Telescope SR / DE-GAN) OCR confidence eval on an in-memory image."""
+    """Run LR (+ optional classic preprocess) OCR confidence eval."""
     pil = pil.convert("RGB")
     lr_size = pil.size
 
     try:
-        lr_lines = run_ocr(pil, ocr)
-        lr_eval = evaluate_ocr(lr_lines, low_threshold)
+        lr_eval = evaluate_ocr(run_ocr(pil, ocr), low_threshold)
 
-        sr_eval = None
-        degan_eval = None
-        sr_size = None
-        sr_elapsed = None
-        degan_elapsed = None
-        sr_image = None
-        degan_image = None
+        pp_eval = None
+        pp_elapsed = None
+        pp_image = None
 
-        if not skip_sr and telescope is not None:
-            sr_result = telescope.predict_full(
-                pil,
-                overlap=overlap,
-                batch_size=batch_size,
-                max_side=max_side,
+        if enhancer is not None:
+            pp_result = enhancer.predict(pil)
+            pp_image = pp_result.enhanced
+            pp_elapsed = pp_result.elapsed_sec
+            pp_eval = evaluate_ocr(
+                run_ocr(Image.fromarray(pp_result.enhanced), ocr), low_threshold
             )
-            sr_image = sr_result.sr
-            sr_size = (sr_result.sr.shape[1], sr_result.sr.shape[0])
-            sr_elapsed = sr_result.elapsed_sec
-            sr_eval = evaluate_ocr(run_ocr(Image.fromarray(sr_result.sr), ocr), low_threshold)
-
-        if degan is not None:
-            degan_result = degan.predict(pil)
-            degan_image = degan_result.enhanced
-            degan_elapsed = degan_result.elapsed_sec
-            degan_eval = evaluate_ocr(run_ocr(Image.fromarray(degan_result.enhanced), ocr), low_threshold)
 
         delta_mean, delta_median = (None, None)
-        delta_mean_d, delta_median_d = (None, None)
-        if sr_eval is not None:
-            delta_mean, delta_median = _delta(lr_eval, sr_eval)
-        if degan_eval is not None:
-            delta_mean_d, delta_median_d = _delta(lr_eval, degan_eval)
+        if pp_eval is not None:
+            delta_mean, delta_median = _delta(lr_eval, pp_eval)
 
         variants: dict[str, OcrEval] = {}
-        if sr_eval is not None:
-            variants["sr"] = sr_eval
-        if degan_eval is not None:
-            variants["degan"] = degan_eval
+        if pp_eval is not None:
+            variants["pp"] = pp_eval
 
         return ImageEvalResult(
             path=path,
             lr_size=lr_size,
             lr=lr_eval,
-            sr=sr_eval,
-            degan=degan_eval,
-            sr_size=sr_size,
-            sr_elapsed_sec=sr_elapsed,
-            degan_elapsed_sec=degan_elapsed,
-            degan_task=degan_task if degan is not None else None,
-            delta_mean=delta_mean,
-            delta_median=delta_median,
-            delta_mean_degan=delta_mean_d,
-            delta_median_degan=delta_median_d,
+            pp=pp_eval,
+            pp_elapsed_sec=pp_elapsed,
+            pp_method=pp_method if enhancer is not None else None,
+            delta_mean_pp=delta_mean,
+            delta_median_pp=delta_median,
             best_by_mean=_pick_best_by_mean(lr_eval, variants),
-            sr_image=sr_image,
-            degan_image=degan_image,
+            pp_image=pp_image,
         )
-    except Exception as exc:  # noqa: BLE001 — collect per-image errors in batch runs
+    except Exception as exc:  # noqa: BLE001
         return ImageEvalResult(path=path, lr_size=lr_size, error=str(exc))
 
 
 def evaluate_image(
     image_path: Path,
     ocr: Any,
-    telescope: Optional[Any],
-    degan: Optional[Any] = None,
+    enhancer: Optional[Any] = None,
     *,
-    overlap: int,
-    batch_size: int,
-    max_side: Optional[int],
     low_threshold: float,
-    skip_sr: bool = False,
-    degan_task: str = "deblur",
+    pp_method: str = "receipt",
 ) -> ImageEvalResult:
     pil = Image.open(image_path).convert("RGB")
     return evaluate_pil(
         pil,
         ocr,
-        telescope,
-        degan,
+        enhancer,
         path=str(image_path),
-        overlap=overlap,
-        batch_size=batch_size,
-        max_side=max_side,
         low_threshold=low_threshold,
-        skip_sr=skip_sr,
-        degan_task=degan_task,
+        pp_method=pp_method,
     )
 
 
@@ -318,8 +261,7 @@ def _collect_variant_scores(results: list[ImageEvalResult], attr: str) -> list[f
 
 def _aggregate(results: list[ImageEvalResult], low_threshold: float) -> dict[str, Any]:
     lr_scores = _collect_variant_scores(results, "lr")
-    sr_scores = _collect_variant_scores(results, "sr")
-    degan_scores = _collect_variant_scores(results, "degan")
+    pp_scores = _collect_variant_scores(results, "pp")
 
     agg: dict[str, Any] = {
         "images": len(results),
@@ -329,23 +271,16 @@ def _aggregate(results: list[ImageEvalResult], low_threshold: float) -> dict[str
     }
     if lr_scores:
         agg["lr"] = asdict(summarize_scores(np.array(lr_scores), low_threshold))
-    if sr_scores:
-        agg["sr"] = asdict(summarize_scores(np.array(sr_scores), low_threshold))
-    if degan_scores:
-        agg["degan"] = asdict(summarize_scores(np.array(degan_scores), low_threshold))
+    if pp_scores:
+        agg["pp"] = asdict(summarize_scores(np.array(pp_scores), low_threshold))
 
     lr_arr = np.array(lr_scores) if lr_scores else None
-    if lr_arr is not None and lr_arr.size:
-        if sr_scores:
-            sr_arr = np.array(sr_scores)
-            agg["delta_mean"] = float(sr_arr.mean() - lr_arr.mean())
-            agg["delta_median"] = float(np.median(sr_arr) - np.median(lr_arr))
-        if degan_scores:
-            deg_arr = np.array(degan_scores)
-            agg["delta_mean_degan"] = float(deg_arr.mean() - lr_arr.mean())
-            agg["delta_median_degan"] = float(np.median(deg_arr) - np.median(lr_arr))
+    if lr_arr is not None and lr_arr.size and pp_scores:
+        pp_arr = np.array(pp_scores)
+        agg["delta_mean_pp"] = float(pp_arr.mean() - lr_arr.mean())
+        agg["delta_median_pp"] = float(np.median(pp_arr) - np.median(lr_arr))
 
-    wins = {"lr": 0, "sr": 0, "degan": 0}
+    wins = {"lr": 0, "pp": 0}
     for item in results:
         if item.best_by_mean in wins:
             wins[item.best_by_mean] += 1
@@ -378,32 +313,25 @@ def _print_image_report(item: ImageEvalResult, low_threshold: float) -> None:
         return
 
     print(f"  LR size: {item.lr_size[0]}×{item.lr_size[1]}")
-    if item.sr_size:
+    if item.pp_elapsed_sec is not None:
         print(
-            f"  SR (Telescope) size: {item.sr_size[0]}×{item.sr_size[1]} "
-            f"({item.sr_elapsed_sec * 1000:.0f} ms)"
-        )
-    if item.degan_elapsed_sec is not None:
-        print(
-            f"  DE-GAN ({item.degan_task}): same size as LR "
-            f"({item.degan_elapsed_sec * 1000:.0f} ms)"
+            f"  classic ({item.pp_method}): "
+            f"{item.pp_image.shape[1]}×{item.pp_image.shape[0]} "
+            f"({item.pp_elapsed_sec * 1000:.0f} ms)"
+            if item.pp_image is not None
+            else f"  classic ({item.pp_method}): ({item.pp_elapsed_sec * 1000:.0f} ms)"
         )
 
     if item.lr:
         _print_eval("LR OCR", item.lr, low_threshold)
-    if item.sr:
-        _print_eval("SR (Telescope) OCR", item.sr, low_threshold)
-    if item.degan:
-        _print_eval("DE-GAN OCR", item.degan, low_threshold)
+    if item.pp:
+        _print_eval("classic OCR", item.pp, low_threshold)
 
-    if item.delta_mean is not None:
-        sign = "+" if item.delta_mean >= 0 else ""
-        print(f"  Δ SR mean={sign}{item.delta_mean:.4f}, Δ median={sign}{item.delta_median:.4f}")
-    if item.delta_mean_degan is not None:
-        sign = "+" if item.delta_mean_degan >= 0 else ""
+    if item.delta_mean_pp is not None:
+        sign = "+" if item.delta_mean_pp >= 0 else ""
         print(
-            f"  Δ DE-GAN mean={sign}{item.delta_mean_degan:.4f}, "
-            f"Δ median={sign}{item.delta_median_degan:.4f}"
+            f"  Δ classic mean={sign}{item.delta_mean_pp:.4f}, "
+            f"Δ median={sign}{item.delta_median_pp:.4f}"
         )
 
     if item.best_by_mean:
@@ -411,17 +339,14 @@ def _print_image_report(item: ImageEvalResult, low_threshold: float) -> None:
 
     if item.lr:
         _print_lines("LR", item.lr)
-    if item.sr:
-        _print_lines("SR (Telescope)", item.sr)
-    if item.degan:
-        _print_lines("DE-GAN", item.degan)
+    if item.pp:
+        _print_lines("classic", item.pp)
 
 
 def _dataclass_to_json(obj: Any) -> Any:
     if hasattr(obj, "__dataclass_fields__"):
         data = asdict(obj)
-        data.pop("sr_image", None)
-        data.pop("degan_image", None)
+        data.pop("pp_image", None)
         return {k: _dataclass_to_json(v) for k, v in data.items()}
     if isinstance(obj, list):
         return [_dataclass_to_json(v) for v in obj]
@@ -430,36 +355,24 @@ def _dataclass_to_json(obj: Any) -> Any:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare PaddleOCR rec confidence: LR vs Telescope SR vs DE-GAN."
+        description="Compare PaddleOCR rec confidence: LR vs classic preprocess."
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--image", type=Path, help="Single image path")
     src.add_argument("--image-dir", type=Path, help="Directory of images")
 
-    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--degan-root", type=Path, default=DEFAULT_DEGAN_ROOT)
     parser.add_argument(
-        "--degan-task",
-        choices=["deblur", "binarize", "unwatermark"],
-        default="deblur",
-        help="DE-GAN enhancement mode (default: deblur for receipts)",
+        "--method",
+        choices=list(CLASSIC_METHODS),
+        default="receipt",
+        help="Classic preprocess method (default: receipt)",
     )
     parser.add_argument("--lang", default="korean")
     parser.add_argument("--low-threshold", type=float, default=0.8)
     parser.add_argument("--rec-score-thresh", type=float, default=0.0)
-    parser.add_argument("--overlap", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-side", type=int, default=None)
-    parser.add_argument("--use-gpu", action="store_true")
-    parser.add_argument("--skip-sr", action="store_true", help="Skip Text Telescope SR")
-    parser.add_argument("--skip-degan", action="store_true", help="Skip DE-GAN enhancement")
+    parser.add_argument("--skip-pp", action="store_true", help="Skip classic preprocess")
     parser.add_argument("--output", type=Path, help="Write JSON report")
-    parser.add_argument(
-        "--save-sr-dir",
-        type=Path,
-        help="Save Telescope SR images as <stem>_sr.png under this directory",
-    )
-    parser.add_argument("--save-degan-dir", type=Path, help="Save DE-GAN enhanced PNGs")
+    parser.add_argument("--save-pp-dir", type=Path, help="Save preprocessed PNGs")
     return parser.parse_args()
 
 
@@ -467,31 +380,12 @@ def main() -> None:
     args = parse_args()
     images = _collect_images(args.image or args.image_dir)
 
-    if args.skip_sr:
-        telescope = None
-    elif not _model_ready(args.model_dir):
-        raise SystemExit(
-            f"Telescope model not found under {args.model_dir}.\n"
-            "Run: python scripts/setup_model.py\n"
-            "Or pass --skip-sr."
-        )
-    else:
-        telescope = get_telescope(args.model_dir, use_gpu=args.use_gpu)
-
-    degan_task: DeGANTask = args.degan_task
-    if args.skip_degan:
-        degan = None
-    elif not degan_ready(args.degan_root, degan_task):
-        raise SystemExit(
-            f"DE-GAN weights not found under {args.degan_root}/weights.\n"
-            "Run: python scripts/setup_degan.py\n"
-            "Or pass --skip-degan."
-        )
-    else:
-        degan = get_degan(args.degan_root, task=degan_task)
-
-    if telescope is None and degan is None:
+    method: ClassicMethod = args.method
+    if args.skip_pp:
+        enhancer = None
         print("Mode: LR OCR baseline only")
+    else:
+        enhancer = get_classic(method=method)
 
     print(f"Loading PaddleOCR (lang={args.lang})…")
     ocr = create_paddle_ocr(args.lang, args.rec_score_thresh)
@@ -501,29 +395,18 @@ def main() -> None:
         item = evaluate_image(
             image_path,
             ocr,
-            telescope,
-            degan,
-            overlap=args.overlap,
-            batch_size=args.batch_size,
-            max_side=args.max_side,
+            enhancer,
             low_threshold=args.low_threshold,
-            skip_sr=args.skip_sr,
-            degan_task=degan_task,
+            pp_method=method,
         )
         results.append(item)
         _print_image_report(item, args.low_threshold)
 
-        if args.save_sr_dir and item.sr_image is not None and not item.error:
-            args.save_sr_dir.mkdir(parents=True, exist_ok=True)
-            out = args.save_sr_dir / f"{image_path.stem}_sr.png"
-            Image.fromarray(item.sr_image).save(out)
-            print(f"  saved SR -> {out}")
-
-        if args.save_degan_dir and item.degan_image is not None and not item.error:
-            args.save_degan_dir.mkdir(parents=True, exist_ok=True)
-            out = args.save_degan_dir / f"{image_path.stem}_degan_{degan_task}.png"
-            Image.fromarray(item.degan_image).save(out)
-            print(f"  saved DE-GAN -> {out}")
+        if args.save_pp_dir and item.pp_image is not None and not item.error:
+            args.save_pp_dir.mkdir(parents=True, exist_ok=True)
+            out = args.save_pp_dir / f"{image_path.stem}_pp_{method}.png"
+            Image.fromarray(item.pp_image).save(out)
+            print(f"  saved classic -> {out}")
 
     aggregate = _aggregate(results, args.low_threshold)
     print("\n=== Aggregate ===")
